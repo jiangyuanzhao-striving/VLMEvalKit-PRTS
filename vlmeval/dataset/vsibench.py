@@ -29,81 +29,99 @@ class VSIBench(VideoBaseDataset):
         "room_size_estimation",
     ]
 
-    def __init__(self, dataset='VSIBench', nframe=0, fps=-1):
-        super().__init__(dataset=dataset, nframe=nframe, fps=fps)
+    def __init__(self,
+                 dataset='VSIBench',
+                 data_root='.',
+                 pack=False,
+                 nframe=0,
+                 fps=-1):
+        try:
+            import decord
+        except Exception as e:
+            logging.critical(f'{type(e)}: {e}')
+            logging.critical('Please install decord via `pip install decord`.')
+
+        self.dataset_name = dataset
+        self.data_root = data_root
+
+        ret = self.prepare_dataset(dataset)
+        assert ret is not None
+
+        lmu_root = LMUDataRoot()
+        self.frame_root = osp.join(lmu_root, 'images', dataset)
+        os.makedirs(self.frame_root, exist_ok=True)
+        self.frame_tmpl = 'frame-{}-of-{}.jpg'
+        self.frame_tmpl_fps = 'frame-{}-of-{}-{}fps.jpg'
+
+        self.data_root = ret['root']
+        self.data_file = ret['data_file']
+        self.data = load(self.data_file)
+        if 'index' not in self.data:
+            self.data['index'] = np.arange(len(self.data))
+
+        assert 'question' in self.data and 'video' in self.data
+        videos = list(set(self.data['video']))
+        videos.sort()
+        self.videos = videos
+        self.pack = pack
+        self.nframe = nframe
+        self.fps = fps
+        if self.fps > 0 and self.nframe > 0:
+            raise ValueError('fps and nframe should not be set at the same time')
+        if self.fps <= 0 and self.nframe <= 0:
+            raise ValueError('fps and nframe should be set at least one valid value')
 
     @classmethod
     def supported_datasets(cls):
         return ['VSIBench']
 
     def prepare_dataset(self, dataset_name='VSIBench', repo_id='nyu-visionx/VSI-Bench'):
-        def check_integrity(pth):
+
+        def unzip_videos(pth):
+            import zipfile
+            if not osp.exists(osp.join(pth, 'arkitscenes')):
+                zip_file = osp.join(pth, 'arkitscenes.zip')
+                with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+                    zip_ref.extractall(pth)
+
+            if not osp.exists(osp.join(pth, 'scannet')):
+                zip_file = osp.join(pth, 'scannet.zip')
+                with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+                    zip_ref.extractall(pth)
+
+            if not osp.exists(osp.join(pth, 'scannetpp')):
+                zip_file = osp.join(pth, 'scannetpp.zip')
+                with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+                    zip_ref.extractall(pth)
+
+        def generate_tsv(pth):
             data_file = osp.join(pth, f'{dataset_name}.tsv')
+            if osp.exists(data_file) and md5(data_file) == self.MD5:
+                return
+            self.data_list = []
+            with open(osp.join(pth, 'test.jsonl'), 'r') as file:
+                for line in file:
+                    data = json.loads(line)
+                    self.data_list.append({
+                        'id': data['id'],
+                        'prefix': data['dataset'],
+                        'video': data['scene_name'],
+                        'type': data['question_type'],
+                        'question': data['question'],
+                        'answer': data['ground_truth'],
+                        'candidates': data['options'],
+                    })
 
-            if not osp.exists(data_file):
-                return False
+            data_df = pd.DataFrame(self.data_list)
+            data_df = data_df.assign(index=range(len(data_df)))
+            data_df.to_csv(data_file, sep='\t', index=False)
 
-            if md5(data_file) != self.MD5:
-                return False
-
-            data = load(data_file)
-            for idx, item in data.iterrows():
-                if not osp.exists(osp.join(pth, item['prefix'], item['video'] + '.mp4')):
-                    return False
-            return True
-        cache_path = get_cache_path(repo_id)
-
-        if cache_path is not None and check_integrity(cache_path):
-            dataset_path = cache_path
-        else:
-            def unzip_videos(pth):
-                import zipfile
-                if not osp.exists(osp.join(pth, 'arkitscenes')):
-                    zip_file = osp.join(pth, 'arkitscenes.zip')
-                    with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-                        zip_ref.extractall(pth)
-
-                if not osp.exists(osp.join(pth, 'scannet')):
-                    zip_file = osp.join(pth, 'scannet.zip')
-                    with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-                        zip_ref.extractall(pth)
-
-                if not osp.exists(osp.join(pth, 'scannetpp')):
-                    zip_file = osp.join(pth, 'scannetpp.zip')
-                    with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-                        zip_ref.extractall(pth)
-
-            def generate_tsv(pth):
-                data_file = osp.join(pth, f'{dataset_name}.tsv')
-                if osp.exists(data_file) and md5(data_file) == self.MD5:
-                    return
-                self.data_list = []
-                with open(osp.join(pth, 'test.jsonl'), 'r') as file:
-                    for line in file:
-                        data = json.loads(line)
-                        self.data_list.append({
-                            'id': data['id'],
-                            'prefix': data['dataset'],
-                            'video': data['scene_name'],
-                            'type': data['question_type'],
-                            'question': data['question'],
-                            'answer': data['ground_truth'],
-                            'candidates': data['options'],
-                        })
-
-                data_df = pd.DataFrame(self.data_list)
-                data_df = data_df.assign(index=range(len(data_df)))
-                data_df.to_csv(data_file, sep='\t', index=False)
-
-            if modelscope_flag_set():
-                from modelscope import dataset_snapshot_download
-                dataset_path = dataset_snapshot_download(dataset_id=repo_id)
-            else:
-                dataset_path = snapshot_download(repo_id=repo_id, repo_type='dataset')
+        dataset_path = self.data_root
+        data_file = osp.join(dataset_path, f'{dataset_name}.tsv')
+        if not os.path.exists(data_file):
             unzip_videos(dataset_path)
             generate_tsv(dataset_path)
 
-        data_file = osp.join(dataset_path, f'{dataset_name}.tsv')
         return dict(root=dataset_path, data_file=data_file)
 
     def save_video_frames(self, line):
@@ -146,9 +164,13 @@ class VSIBench(VideoBaseDataset):
             line = self.data.iloc[line]
 
         message = []
-        img_frame_paths = self.save_video_frames(line)
-        for im in img_frame_paths:
-            message.append(dict(type='image', value=im))
+        if video_llm:
+            video_path = osp.join(self.data_root, line['prefix'], line['video'] + '.mp4')
+            message.append(dict(type='video', value=video_path))
+        else:
+            img_frame_paths = self.save_video_frames(line)
+            for im in img_frame_paths:
+                message.append(dict(type='image', value=im))
 
         pre_prompt = "These are frames of a video."  # pre_prompt = ""
 
